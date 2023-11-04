@@ -1,0 +1,210 @@
+#!/bin/bash
+sudo apt update
+sudo swapoff -a
+(crontab -l 2>/dev/null; echo "@reboot /sbin/swapoff -a") | crontab - || true
+# sysctl params required by setup, params persist across reboots
+sudo tee /etc/sysctl.d/kubernetes.conf<<EOF
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+EOF
+# Configure dns
+sudo sed -i "/search symphony.local/c\search symphony.local" /etc/resolv.conf
+sudo apt install net-tools
+# Apply sysctl params without reboot
+sudo sysctl --system
+# Install docker
+sudo apt update
+sudo apt install -y curl gnupg2 software-properties-common apt-transport-https ca-certificates
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+sudo apt update
+sudo apt install -y containerd.io docker-ce docker-ce-cli
+sudo mkdir -p /etc/systemd/system/docker.service.d
+# Create daemon json config file
+sudo tee /etc/docker/daemon.json <<EOF
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },
+  "storage-driver": "overlay2"
+}
+EOF
+# Start and enable Services
+sudo systemctl daemon-reload 
+sudo systemctl restart docker
+sudo systemctl enable docker
+sudo apt update
+sudo apt -y install git wget curl
+# Install docker shim and Containerd
+wget https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.7/cri-dockerd-0.3.7.amd64.tgz
+tar xvf cri-dockerd-0.3.7.amd64.tgz
+sudo mv cri-dockerd/cri-dockerd /usr/local/bin/
+wget https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.service
+wget https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.socket
+sudo mv cri-docker.socket cri-docker.service /etc/systemd/system/
+sudo sed -i -e 's,/usr/bin/cri-dockerd,/usr/local/bin/cri-dockerd,' /etc/systemd/system/cri-docker.service
+sudo systemctl daemon-reload
+sudo systemctl enable cri-docker.service
+sudo systemctl enable --now cri-docker.socket
+## install kubernetes packages
+echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+sudo apt update
+sudo apt-get update --allow-unauthenticated
+sudo apt-get install -y kubelet=1.27.6-00 kubectl=1.27.6-00 kubeadm=1.27.6-00
+sudo kubeadm config images pull
+sudo apt-mark hold kubelet kubeadm kubectl
+
+#------------------------------------------------------------------------------#
+# Master: initialise cluster
+#------------------------------------------------------------------------------#
+kubeadm init \
+  --token "${token}" \
+  --kubernetes-version=v1.27.6 \
+  --token-ttl 10m \
+  --apiserver-cert-extra-sans "${master-1_public_ip}" \
+  --cri-socket=unix:///var/run/cri-dockerd.sock \
+  --pod-network-cidr "192.168.0.0/16" \
+  --node-name master-1
+
+#------------------------------------------------------------------------------#
+# Install CNI, CSI, and aws-load-balancer-controller
+#------------------------------------------------------------------------------#
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+# Label worker nodes
+count=${worker_index}
+for ((i=1; i <= count; i++))
+do
+  kubectl label node worker-$i node-role.kubernetes.io/worker=worker
+done
+
+
+# Install Helm
+export PATH=$PATH:/usr/local/bin
+curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+sudo chmod 700 get_helm.sh
+sudo ./get_helm.sh
+
+# Install calico
+# kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.3/manifests/calico.yaml
+
+helm repo add projectcalico https://docs.tigera.io/calico/charts
+helm repo update
+kubectl create namespace tigera-operator
+helm install calico projectcalico/tigera-operator --version v3.26.3 --namespace tigera-operator
+
+sleep 120
+# Install Metallb with Helm
+kubectl create namespace mlb
+helm repo add metallb https://metallb.github.io/metallb
+helm repo update
+helm install metallb metallb/metallb -n mlb
+
+sleep 60
+# Create the IPAddressPool and L2Advertisement
+cat <<EOF | kubectl apply -f -
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: default-pool
+  namespace: mlb
+spec:
+  addresses:
+  - "${ipaddresspool}"
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: default-pool
+  namespace: mlb
+EOF
+
+# Install Zadara CSI
+helm repo add zadara-csi-helm https://raw.githubusercontent.com/zadarastorage/zadara-csi/release/zadara-csi-helm
+helm repo update
+helm install csi-snapshots-v1 zadara-csi-helm/snapshots-v1
+helm install zadara-csi zadara-csi-helm/zadara-csi
+
+cat <<EOF | kubectl apply -f -
+apiVersion: storage.zadara.com/v1
+kind: VSCStorageClass
+metadata:
+  name: zadara-svc-storage-class
+spec:
+  displayName: "VSC Storage Class"
+  isDefault: true
+EOF
+cat <<EOF | kubectl apply -f -
+apiVersion: storage.zadara.com/v1
+kind: VPSA
+metadata:
+  name: vpsa-default
+spec:
+  displayName: "Default VPSA"
+  hostname: "${vpsa_host}"
+  token: "${vpsa_token}"
+  VSCStorageClassName: "zadara-svc-storage-class"
+EOF
+cat <<EOF | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: zadara-csi-nas
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: csi.zadara.com
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+mountOptions: []
+parameters:
+  VSCStorageClassName: zadara-svc-storage-class
+  volumeOptions: ''
+EOF
+
+if "${otomi}" ; then
+# Let's wait a couple of minutes to make sure all dependencies and running before we start installing Otomi
+
+helm repo add otomi https://otomi.io/otomi-core
+helm repo update
+
+sudo tee otomi-values.yaml<<EOF
+cluster:
+  name: zadara
+  provider: custom
+  domainSuffix: "${otomi_domainSuffix}"
+otomi:
+  hasExternalDNS: true
+ingress:
+  platformClass:
+    entrypoint: "${otomi_entrypoint}"
+dns:
+  domainFilters: 
+    - "${domainFilter}"
+  provider:
+    aws:
+      credentials:
+        secretKey: "${otomi_dns_secretKey}"
+        accessKey: "${otomi_dns_accessKey}"
+      region: eu-central-1
+apps:
+  cert-manager:
+    issuer: letsencrypt
+    stage: production
+    email: "${otomi_email}"
+  metrics-server:
+    extraArgs:
+      kubelet-insecure-tls: true
+      kubelet-preferred-address-types: InternalIP
+EOF
+
+helm install -f otomi-values.yaml otomi otomi/otomi 
+fi
+
+# Indicate completion
+touch /home/ubuntu/done

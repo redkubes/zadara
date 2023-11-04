@@ -1,0 +1,74 @@
+#!/bin/bash
+
+#!/usr/bin/env bash
+
+sudo apt update
+sudo swapoff -a
+(crontab -l 2>/dev/null; echo "@reboot /sbin/swapoff -a") | crontab - || true
+# sysctl params required by setup, params persist across reboots
+sudo tee /etc/sysctl.d/kubernetes.conf<<EOF
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+EOF
+# Configure dns
+sudo sed -i "/search symphony.local/c\search symphony.local" /etc/resolv.conf
+sudo apt install net-tools
+# Apply sysctl params without reboot
+sudo sysctl --system
+# Install docker
+sudo apt update
+sudo apt install -y curl gnupg2 software-properties-common apt-transport-https ca-certificates
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+sudo apt update
+sudo apt install -y containerd.io docker-ce docker-ce-cli
+sudo mkdir -p /etc/systemd/system/docker.service.d
+# Create daemon json config file
+sudo tee /etc/docker/daemon.json <<EOF
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },
+  "storage-driver": "overlay2"
+}
+EOF
+# Start and enable Services
+sudo systemctl daemon-reload 
+sudo systemctl restart docker
+sudo systemctl enable docker
+sudo apt update
+sudo apt -y install git wget curl
+# Install docker shim and Containerd
+wget https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.7/cri-dockerd-0.3.7.amd64.tgz
+tar xvf cri-dockerd-0.3.7.amd64.tgz
+sudo mv cri-dockerd/cri-dockerd /usr/local/bin/
+wget https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.service
+wget https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.socket
+sudo mv cri-docker.socket cri-docker.service /etc/systemd/system/
+sudo sed -i -e 's,/usr/bin/cri-dockerd,/usr/local/bin/cri-dockerd,' /etc/systemd/system/cri-docker.service
+sudo systemctl daemon-reload
+sudo systemctl enable cri-docker.service
+sudo systemctl enable --now cri-docker.socket
+## install kubernetes packages
+echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+sudo apt update
+sudo apt-get update --allow-unauthenticated
+sudo apt-get install -y kubelet=1.27.6-00 kubectl=1.27.6-00 kubeadm=1.27.6-00
+sudo kubeadm config images pull
+sudo apt-mark hold kubelet kubeadm kubectl
+
+#------------------------------------------------------------------------------#
+# Worker: join cluster
+#------------------------------------------------------------------------------#
+kubeadm join "${master-1_private_ip}:6443" \
+  --token "${token}" \
+  --discovery-token-unsafe-skip-ca-verification \
+  --node-name worker-${worker_index} \
+  --cri-socket=unix:///var/run/cri-dockerd.sock
+
+# Indicate completion
+touch /home/ubuntu/done
